@@ -1,0 +1,33 @@
+[package]
+name = "synapse-stt-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+description = "Framework-agnostic speech-to-text logic (ElevenLabs cloud + local Whisper/Moonshine via whisper-apr)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Saimirbaci/stt_core"
+readme = "README.md"
+keywords = ["speech-to-text", "whisper", "asr", "transcription", "audio"]
+categories = ["multimedia::audio", "science"]
+authors = ["Saimir Baci"]
+
+[lib]
+name = "stt_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+base64 = "0.22"
+futures-util = "0.3"
+log = "0.4"
+
+[target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
+hound = "3.5"
+whisper-apr = { version = "0.2", default-features = false, features = ["symphonia", "std"] }
+safetensors = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
