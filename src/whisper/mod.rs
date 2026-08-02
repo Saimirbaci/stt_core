@@ -382,22 +382,157 @@ pub fn transcribe_local(
         ));
     }
 
+    let audio_secs = samples.len() as f32 / 16000.0;
+    log::info!(
+        "transcribing {:.1}s of audio with '{}'",
+        audio_secs,
+        model_id
+    );
+    let started = std::time::Instant::now();
+
+    let result = run_inference(&samples, model_id, whisper_state, models_dir)?;
+
+    let text = result.text.trim().to_string();
+    log::info!(
+        "transcribed {:.1}s in {:.1}s ({} chars)",
+        audio_secs,
+        started.elapsed().as_secs_f32(),
+        text.len()
+    );
+    Ok(text)
+}
+
+/// Load the model if needed and run one inference pass over 16kHz mono samples.
+///
+/// Both the lock acquisition and the inference call are hardened: a panic
+/// inside the engine (e.g. an incompatible model) would otherwise poison the
+/// model mutex and brick every subsequent transcription for the process
+/// lifetime, so panics are caught and the poisoned guard is recovered.
+fn run_inference(
+    samples: &[f32],
+    model_id: &str,
+    whisper_state: &WhisperState,
+    models_dir: &Path,
+) -> Result<whisper_apr::TranscriptionResult, SttError> {
     ensure_model(whisper_state, models_dir, model_id)?;
 
     let model_guard = whisper_state
         .model
         .lock()
-        .map_err(|e| SttError::TranscribeFailed(e.to_string()))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let model = model_guard
         .as_ref()
         .ok_or_else(|| SttError::TranscribeFailed("Model not loaded".to_string()))?;
 
     let options = TranscribeOptions::default();
-    let result = model
-        .transcribe(&samples, options)
-        .map_err(|e| SttError::TranscribeFailed(format!("Transcription failed: {}", e)))?;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        model.transcribe(samples, options)
+    }))
+    .map_err(|_| {
+        SttError::TranscribeFailed(format!(
+            "Local transcription crashed for model '{}'. This model may be \
+             incompatible with the current engine.",
+            model_id
+        ))
+    })?
+    .map_err(|e| SttError::TranscribeFailed(format!("Transcription failed: {}", e)))
+}
 
-    Ok(result.text.trim().to_string())
+// =============================================================================
+// Incremental Live Transcription (VAD-free, Whisper-segment based)
+// =============================================================================
+//
+// The energy-based VAD in whisper-apr proved too crude to segment continuous
+// speech reliably (it misclassifies speech as silence, which would drop audio).
+// Instead we transcribe a *contiguous* growing window starting at a committed
+// cursor and use Whisper's own segment timestamps to decide commit points:
+// every segment except the last (still-in-progress) one is committed once it is
+// stable, and the cursor advances to its end. This is loss-proof (contiguous
+// transcription) and keeps per-tick cost bounded to roughly one utterance,
+// because the cursor jumps forward after each commit.
+
+/// Minimum new audio (seconds) before a live pass is worth running.
+pub const LIVE_MIN_REGION_SEC: f32 = 1.0;
+/// A trailing segment is "stable" once at least this much audio follows its end.
+pub const LIVE_TRAILING_GUARD_SEC: f32 = 1.0;
+/// Force-commit the whole window past this length so cost stays bounded even
+/// during long pause-free speech. Callers must keep their rolling preview
+/// buffer longer than this so the committed cursor never falls outside it.
+pub const LIVE_MAX_WINDOW_SEC: f32 = 28.0;
+
+/// One transcribed segment: `(start_sec, end_sec, text)` relative to the start
+/// of the transcribed region.
+pub type Segment = (f32, f32, String);
+
+/// Outcome of applying the live commit policy to one window's segments.
+#[derive(Debug, Clone, Default)]
+pub struct CommitDecision {
+    /// Newly finalized text (may be empty).
+    pub committed_text: String,
+    /// How far into the region the cursor advanced, if anything was committed.
+    pub commit_to_sec: Option<f32>,
+    /// Volatile preview of the in-progress tail (empty when text was committed).
+    pub pending_text: String,
+}
+
+/// Transcribe a 16kHz mono buffer and return its segments.
+///
+/// Synchronous like [`transcribe_local`] — run it on a blocking thread.
+pub fn transcribe_segments(
+    samples: &[f32],
+    model_id: &str,
+    whisper_state: &WhisperState,
+    models_dir: &Path,
+) -> Result<Vec<Segment>, SttError> {
+    let result = run_inference(samples, model_id, whisper_state, models_dir)?;
+    Ok(result
+        .segments
+        .into_iter()
+        .map(|s| (s.start, s.end, s.text))
+        .collect())
+}
+
+/// Apply the live commit policy to one window's segments.
+///
+/// `region_dur` is the length in seconds of the audio the segments came from.
+pub fn commit_segments(segs: &[Segment], region_dur: f32) -> CommitDecision {
+    let mut committed_text = String::new();
+    let mut commit_to_sec: Option<f32> = None;
+    for (i, (_start, end, text)) in segs.iter().enumerate() {
+        let is_last = i == segs.len() - 1;
+        let stable = !is_last || *end <= region_dur - LIVE_TRAILING_GUARD_SEC;
+        if !stable {
+            break;
+        }
+        committed_text.push_str(text.trim());
+        committed_text.push(' ');
+        commit_to_sec = Some(*end);
+    }
+
+    // Force-commit to bound cost during long pause-free speech.
+    if commit_to_sec.is_none() && region_dur > LIVE_MAX_WINDOW_SEC {
+        committed_text = join_segments(segs);
+        commit_to_sec = segs.last().map(|(_, end, _)| *end);
+    }
+
+    let pending_text = if commit_to_sec.is_some() {
+        String::new()
+    } else {
+        join_segments(segs)
+    };
+
+    CommitDecision {
+        committed_text: committed_text.trim().to_string(),
+        commit_to_sec,
+        pending_text,
+    }
+}
+
+fn join_segments(segs: &[Segment]) -> String {
+    segs.iter()
+        .map(|(_, _, t)| t.trim())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Preload model into memory (called from setup for fast first transcription).
@@ -488,5 +623,57 @@ mod tests {
         let state = WhisperState::new();
         let err = ensure_model(&state, dir.path(), "not-a-model").unwrap_err();
         assert!(matches!(err, SttError::ModelNotFound(_)));
+    }
+
+    fn seg(start: f32, end: f32, text: &str) -> Segment {
+        (start, end, text.to_string())
+    }
+
+    #[test]
+    fn commit_segments_holds_back_unstable_trailing_segment() {
+        // Region is 5s long; the last segment ends at 4.5s, so less than
+        // LIVE_TRAILING_GUARD_SEC of audio follows it — it stays pending.
+        let segs = vec![seg(0.0, 2.0, " hello "), seg(2.0, 4.5, " world ")];
+        let d = commit_segments(&segs, 5.0);
+        assert_eq!(d.committed_text, "hello");
+        assert_eq!(d.commit_to_sec, Some(2.0));
+        assert_eq!(d.pending_text, "");
+    }
+
+    #[test]
+    fn commit_segments_commits_trailing_segment_once_stable() {
+        let segs = vec![seg(0.0, 2.0, "hello"), seg(2.0, 4.0, "world")];
+        let d = commit_segments(&segs, 6.0);
+        assert_eq!(d.committed_text, "hello world");
+        assert_eq!(d.commit_to_sec, Some(4.0));
+        assert_eq!(d.pending_text, "");
+    }
+
+    #[test]
+    fn commit_segments_returns_pending_preview_when_nothing_stable() {
+        let segs = vec![seg(0.0, 1.8, " still talking ")];
+        let d = commit_segments(&segs, 2.0);
+        assert_eq!(d.committed_text, "");
+        assert_eq!(d.commit_to_sec, None);
+        assert_eq!(d.pending_text, "still talking");
+    }
+
+    #[test]
+    fn commit_segments_force_commits_past_max_window() {
+        // One long pause-free segment: nothing is stable, but the window has
+        // grown past LIVE_MAX_WINDOW_SEC so cost must be bounded by committing.
+        let segs = vec![seg(0.0, 29.5, "a long uninterrupted monologue")];
+        let d = commit_segments(&segs, LIVE_MAX_WINDOW_SEC + 1.0);
+        assert_eq!(d.committed_text, "a long uninterrupted monologue");
+        assert_eq!(d.commit_to_sec, Some(29.5));
+        assert_eq!(d.pending_text, "");
+    }
+
+    #[test]
+    fn commit_segments_empty_input_commits_nothing() {
+        let d = commit_segments(&[], 30.0);
+        assert_eq!(d.committed_text, "");
+        assert_eq!(d.commit_to_sec, None);
+        assert_eq!(d.pending_text, "");
     }
 }

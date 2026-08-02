@@ -26,8 +26,27 @@ log = "0.4"
 
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
 hound = "3.5"
-whisper-apr = { version = "0.2", default-features = false, features = ["symphonia", "std"] }
+# Speed features: `simd` math + `parallel` (rayon) multithreading; `symphonia`
+# adds non-WAV decoding. We drop the default `realizar-inference` engine and use
+# the trueno-based one — this is the exact feature set verified to transcribe
+# correctly. (Either engine works once tensors load; the historical
+# garbage-output bug was a tensor-name-prefix mismatch, not the engine.)
+whisper-apr = { version = "0.2", default-features = false, features = ["std", "simd", "parallel", "symphonia"] }
 safetensors = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Moonshine support requires a one-line fix to whisper-apr's
+# metadata_to_model_config: upstream routes Moonshine through the Whisper (MHA)
+# block path whenever kv_heads == n_text_head (always true for Moonshine), so
+# the moonshine weights never load and transcripts come out empty. Our fork
+# always selects the GQA/RoPE blocks for the moonshine architecture.
+# Remove this patch once the fix is released upstream (paiml/whisper.apr).
+#
+# NOTE: Cargo only honours [patch] from the root of the crate graph, so this
+# applies to this repo's own builds/tests/CI only. Downstream consumers that
+# depend on this crate must declare the same patch in their own workspace root
+# to get working Moonshine models (Whisper models are unaffected).
+[patch.crates-io]
+whisper-apr = { git = "https://github.com/Saimirbaci/whisper.apr.git", rev = "c9cc4e8b621b3b9ff7e568a3575ea918c9590981" }

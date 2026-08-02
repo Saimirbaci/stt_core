@@ -1,8 +1,3 @@
-# NOTE: this workflow is staged for when stt_core is split into its own
-# repository. GitHub Actions only discovers workflows under
-# `.github/workflows` at the *repository root* — while this file lives at
-# `stt_core/.github/workflows/ci.yml` inside the synapse_voice monorepo, it
-# does not run. It becomes live once this directory becomes a repo root.
 name: CI
 
 on:

@@ -54,6 +54,33 @@ let models_dir = Path::new("/path/to/models");
 let text = transcribe_whisper(&audio_bytes, "wav", "whisper-tiny", &whisper_state, models_dir)?;
 ```
 
+### Incremental (live) transcription
+
+For live preview while recording, transcribe a contiguous window that grows
+from a committed cursor and let Whisper's own segment timestamps decide the
+commit points — no VAD involved:
+
+```rust
+use stt_core::{commit_segments, transcribe_segments, LIVE_MIN_REGION_SEC};
+
+// `samples` is 16kHz mono f32 audio starting at your committed cursor.
+let region_dur = samples.len() as f32 / 16000.0;
+if region_dur >= LIVE_MIN_REGION_SEC {
+    let segs = transcribe_segments(&samples, "moonshine-tiny", &whisper_state, models_dir)?;
+    let decision = commit_segments(&segs, region_dur);
+    // Append `decision.committed_text` to the running transcript, advance the
+    // cursor by `decision.commit_to_sec`, and render `decision.pending_text`
+    // as a volatile preview that the next pass replaces.
+}
+```
+
+Every segment but the last is committed immediately; the trailing (still
+in-progress) one is held back until at least `LIVE_TRAILING_GUARD_SEC` of audio
+follows it. Past `LIVE_MAX_WINDOW_SEC` the whole window is force-committed so
+per-pass cost stays bounded during long pause-free speech — keep your rolling
+audio buffer longer than that constant, or the cursor can fall outside it.
+`transcribe_segments` is synchronous like `transcribe_whisper`.
+
 ### Downloading a model
 
 ```rust
@@ -106,6 +133,21 @@ stt_core = { git = "https://github.com/Saimirbaci/stt_core", tag = "v0.1.0", pac
 
 Pin to a specific tag or commit — pointing at a branch will silently drift as
 the crate evolves.
+
+### Moonshine models need a whisper-apr patch
+
+Upstream `whisper-apr` routes Moonshine through the Whisper (MHA) block path
+whenever `kv_heads == n_text_head`, which is always true for Moonshine — the
+weights never load and transcripts come out empty. This repo patches that for
+its own builds, but Cargo only honours `[patch]` from the **root of the crate
+graph**, so a consumer's patch section is what counts. Add the same patch to
+your workspace root if you use the `moonshine-*` models (Whisper models work
+unpatched):
+
+```toml
+[patch.crates-io]
+whisper-apr = { git = "https://github.com/Saimirbaci/whisper.apr.git", rev = "c9cc4e8b621b3b9ff7e568a3575ea918c9590981" }
+```
 
 ## License
 

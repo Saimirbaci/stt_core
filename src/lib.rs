@@ -23,7 +23,8 @@ pub use types::{AudioFormat, SttConfig};
 pub use whisper::download::download_and_convert_model;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use whisper::{
-    transcribe_local as transcribe_whisper, DownloadProgress, WhisperModelInfo, WhisperState,
+    commit_segments, transcribe_local as transcribe_whisper, transcribe_segments, CommitDecision,
+    DownloadProgress, Segment, WhisperModelInfo, WhisperState, LIVE_MIN_REGION_SEC,
 };
 
 /// Which backend a transcription request should be routed to, per
